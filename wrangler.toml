@@ -1,0 +1,7 @@
+name = "inkling-proxy"
+main = "src/index.ts"
+compatibility_date = "2026-05-15"
+
+# Secrets (managed via `wrangler secret put`):
+#   ANTHROPIC_API_KEY  -- your Anthropic API key
+#   SHARED_SECRET      -- random string the iOS app sends as Bearer token
