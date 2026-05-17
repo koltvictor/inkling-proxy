@@ -91,6 +91,59 @@ When recommending reading or naming writers, draw from the pre-approved lists be
 
 const INTERPRETATION_SYSTEM_PROMPT = `${SAFETY_CONSTITUTION}\n\n${INTERPRETATION_TASK}`;
 
+const CLASSIFY_TASK = `The user has typed a brief description of what brought them to Inkling. They have not yet chosen a path. Your task is to recommend the 1 or 2 paths from Inkling's five whose screening instruments are most likely to surface useful information about what they described.
+
+Inkling's five paths and what each screener is built to detect:
+
+- autism: AQ-10, RAADS-R, CAT-Q. Sensory sensitivity, social communication patterns, masking and camouflaging, late-recognized adult autistic experience.
+- anxiety: GAD-7. Sustained worry, anticipatory thinking, the body's stress response, rehearsal, catastrophizing, the difference between adaptive and chronic anxiety.
+- depression: PHQ-9. Low mood, anhedonia (loss of pleasure), heaviness, energy depletion, the dimming of things that used to matter.
+- adhd: ASRS-v1.1 Part A. Executive function patterns, time blindness, the gap between intention and follow-through, the capable-but-inconsistent experience.
+- trauma: PCL-5. Post-traumatic patterns — intrusion (memories, dreams, flashbacks), avoidance, the body's altered baseline, hypervigilance, the long shadow of a difficult experience.
+
+There are also patterns that fall OUTSIDE what Inkling is built to screen for. When the user's description clearly and primarily points to one of these, do not recommend a screening path — route to outOfScope instead. The seven out-of-scope categories and their distinguishing patterns:
+
+- psychotic-spectrum: hearing voices others do not hear, seeing things others do not see, beliefs that feel real but lack external corroboration, paranoid patterns without external basis, thought disorganization, ideas of reference (feeling watched, followed, or that ordinary events carry hidden personal meaning).
+- bipolar-spectrum: mood cycling between elevated/energized/expansive periods and low/depressed ones; periods of greatly reduced need for sleep without feeling tired; impulsive behavior (spending, sexual, risky decisions) concentrated in elevated states; the user explicitly names bipolar. Do not route here for low mood alone — bipolar requires evidence of cycling, not just depression.
+- eating-patterns: restriction (deliberate undereating, skipping meals as a pattern), binge episodes, purging, compulsive exercise, or preoccupation with food/weight/body shape that the user describes as difficult to step back from.
+- ocd: intrusive unwanted thoughts paired with compulsions performed in response — checking, counting, washing, mental rituals, reassurance-seeking. Both elements must be present in the description. Intrusive worry alone without compulsions is generalized anxiety, not OCD.
+- substance-use: drinking or drug use that has gotten harder to step back from, tolerance or withdrawal, use affecting work/relationships/sense of self, often paired with shame or hidden behavior around use.
+- dissociation: feeling disconnected from self or from reality, time loss, finding evidence of doing things not remembered, feeling like more than one part of self. Often paired with trauma history but distinct from straightforward PTSD intrusion — for mild dissociation in a clearly trauma-driven context, prefer the trauma path.
+- personality-patterns: long-standing patterns in relationships and sense of self that the user describes as persistent or as "how I have always been" — intense interpersonal difficulties spanning many relationships, identity instability, patterns the user themselves frames as long-standing rather than recent. Many users describing these patterns will not name them — listen for "this is just how I am" or descriptions of repeated relational rupture rather than for diagnostic vocabulary.
+
+Be conservative. Route to outOfScope only when the signal is clear AND primary in the description. If a user's description merely brushes against one of these categories alongside what would be an Inkling-path concern, recommend the closest Inkling path and let the interpretation engage with the nuance. When in doubt, recommend a path.
+
+OUTPUT: strict JSON only. No preamble, no markdown fences, no explanation outside the JSON.
+
+Required shape:
+{
+  "recommendations": [
+    { "pathId": "<pathId>", "rationale": "<one-sentence rationale grounded in the user's specific words>" }
+  ],
+  "crisis": false,
+  "outOfScope": null
+}
+
+Three exclusive outcomes:
+1. Crisis (highest precedence): set "crisis": true, return empty recommendations array, set "outOfScope": null. Crisis routing takes precedence over everything else.
+2. Out-of-scope: set "outOfScope": {"category": "<categoryId>", "rationale": "<one-sentence rationale grounded in the user's specific words>"}, return empty recommendations array, set "crisis": false.
+3. Path recommendation: populate recommendations with 1 or 2 paths, set "crisis": false, set "outOfScope": null.
+
+categoryId for outOfScope must be exactly one of: "psychotic-spectrum", "bipolar-spectrum", "eating-patterns", "ocd", "substance-use", "dissociation", "personality-patterns".
+
+Rules:
+- Recommend exactly 1 or 2 paths. If signals span multiple, pick the two most clearly indicated.
+- Each rationale must be ONE sentence and must reference the user's specific language — quote a short phrase from their description or paraphrase a specific detail. Generic rationales ("this seems related to anxiety") are not acceptable.
+- pathId values must be exactly one of: "autism", "anxiety", "depression", "adhd", "trauma".
+- If the user's description does not clearly fit any path, recommend the single closest match with a rationale that acknowledges the ambiguity.
+- Never recommend a path that does not fit just to fill two slots. Quality over quantity — one well-matched recommendation is better than two weak ones.
+
+CRISIS: If the description contains active suicidal ideation, plans to harm self or others, ongoing abuse or currently-unsafe situations, severe dissociation, or end-of-resource phrasings ("I don't know what I'll do," "I can't keep going," "something has to give," "I'm at the end of my rope," "I've run out of options," "I don't see a way out"), set "crisis": true, return an empty recommendations array, and set "outOfScope": null. Crisis takes precedence over outOfScope — when both could apply, route as crisis. The app will route the user to safety resources separately.
+
+Return ONLY the JSON object.`;
+
+const CLASSIFY_SYSTEM_PROMPT = `${SAFETY_CONSTITUTION}\n\n${CLASSIFY_TASK}`;
+
 function buildUserPrompt(payload: InterpretPayload): string {
   const parts: string[] = [];
 
@@ -201,6 +254,161 @@ async function handleInterpret(request: Request, env: Env): Promise<Response> {
   }
 }
 
+interface ClassifyPayload {
+  intakeText: string;
+}
+
+interface ClassifyRecommendation {
+  pathId: string;
+  rationale: string;
+}
+
+interface OutOfScope {
+  category: string;
+  rationale: string;
+}
+
+interface ClassifyResponse {
+  recommendations: ClassifyRecommendation[];
+  crisis: boolean;
+  outOfScope: OutOfScope | null;
+}
+
+const VALID_PATH_IDS = new Set(["autism", "anxiety", "depression", "adhd", "trauma"]);
+
+const VALID_OUT_OF_SCOPE_CATEGORIES = new Set([
+  "psychotic-spectrum",
+  "bipolar-spectrum",
+  "eating-patterns",
+  "ocd",
+  "substance-use",
+  "dissociation",
+  "personality-patterns",
+]);
+
+async function handleClassify(request: Request, env: Env): Promise<Response> {
+  const corsHeaders = {
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods": "POST, OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type, Authorization",
+  };
+
+  if (request.method === "OPTIONS") {
+    return new Response(null, { status: 204, headers: corsHeaders });
+  }
+
+  if (request.method !== "POST") {
+    return new Response("Method not allowed", { status: 405, headers: corsHeaders });
+  }
+
+  const auth = request.headers.get("Authorization") || "";
+  const expected = `Bearer ${env.SHARED_SECRET}`;
+  if (auth !== expected) {
+    return new Response("Unauthorized", { status: 401, headers: corsHeaders });
+  }
+
+  let payload: ClassifyPayload;
+  try {
+    payload = await request.json();
+  } catch {
+    return new Response("Invalid JSON", { status: 400, headers: corsHeaders });
+  }
+
+  if (!payload.intakeText || typeof payload.intakeText !== "string") {
+    return new Response("Missing intakeText", { status: 400, headers: corsHeaders });
+  }
+
+  const userPrompt = `User intake text:\n${payload.intakeText}`;
+
+  try {
+    const response = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": env.ANTHROPIC_API_KEY,
+        "anthropic-version": "2023-06-01",
+      },
+      body: JSON.stringify({
+        model: "claude-opus-4-7",
+        max_tokens: 600,
+        system: CLASSIFY_SYSTEM_PROMPT,
+        messages: [{ role: "user", content: userPrompt }],
+      }),
+    });
+
+    if (!response.ok) {
+      const errText = await response.text();
+      return new Response(
+        JSON.stringify({ error: "anthropic_api_error", detail: errText }),
+        { status: 502, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+      );
+    }
+
+    const data = await response.json() as any;
+    const rawText = data.content?.[0]?.text || "";
+
+    // Strip markdown fences defensively in case the model adds them
+    const cleaned = rawText
+      .replace(/^```json\s*/i, "")
+      .replace(/^```\s*/i, "")
+      .replace(/```\s*$/i, "")
+      .trim();
+
+    let parsed: ClassifyResponse;
+    try {
+      parsed = JSON.parse(cleaned);
+    } catch {
+      // Parse failed — return empty recommendations so app can fall back to triage
+      return new Response(
+        JSON.stringify({ recommendations: [], crisis: false, outOfScope: null, parseError: true }),
+        { status: 200, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+      );
+    }
+
+    // Validate and clean response shape
+    if (!Array.isArray(parsed.recommendations)) parsed.recommendations = [];
+    if (typeof parsed.crisis !== "boolean") parsed.crisis = false;
+
+    // Validate outOfScope shape
+    if (parsed.outOfScope && typeof parsed.outOfScope === "object") {
+      const oos = parsed.outOfScope as any;
+      if (
+        typeof oos.category === "string" &&
+        VALID_OUT_OF_SCOPE_CATEGORIES.has(oos.category) &&
+        typeof oos.rationale === "string"
+      ) {
+        parsed.outOfScope = { category: oos.category, rationale: oos.rationale };
+      } else {
+        parsed.outOfScope = null;
+      }
+    } else {
+      parsed.outOfScope = null;
+    }
+
+    parsed.recommendations = parsed.recommendations
+      .filter(r => r && typeof r.pathId === "string" && VALID_PATH_IDS.has(r.pathId) && typeof r.rationale === "string")
+      .slice(0, 2);
+
+    // Enforce exclusivity: crisis > outOfScope > recommendations
+    if (parsed.crisis) {
+      parsed.outOfScope = null;
+      parsed.recommendations = [];
+    } else if (parsed.outOfScope) {
+      parsed.recommendations = [];
+    }
+
+    return new Response(
+      JSON.stringify(parsed),
+      { status: 200, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+    );
+  } catch (err) {
+    return new Response(
+      JSON.stringify({ error: "worker_error", detail: String(err) }),
+      { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+    );
+  }
+}
+
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
@@ -209,6 +417,9 @@ export default {
     }
     if (url.pathname === "/interpret") {
       return handleInterpret(request, env);
+    }
+    if (url.pathname === "/classify") {
+      return handleClassify(request, env);
     }
     return new Response("Not found", { status: 404 });
   },
